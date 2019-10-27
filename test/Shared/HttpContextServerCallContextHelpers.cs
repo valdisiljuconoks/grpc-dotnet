@@ -22,19 +22,26 @@ using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 
-namespace Grpc.AspNetCore.FunctionalTests.Infrastructure
+namespace Grpc.Tests.Shared
 {
     internal static class HttpContextServerCallContextHelper
     {
         public static HttpContextServerCallContext CreateServerCallContext(
-            HttpContext httpContext = null,
-            GrpcServiceOptions serviceOptions = null,
-            ILogger logger = null)
+            HttpContext? httpContext = null,
+            GrpcServiceOptions? serviceOptions = null,
+            ILogger? logger = null,
+            bool initialize = true)
         {
-            return new HttpContextServerCallContext(
+            var context = new HttpContextServerCallContext(
                 httpContext ?? new DefaultHttpContext(),
                 serviceOptions ?? new GrpcServiceOptions(),
                 logger ?? NullLogger.Instance);
+            if (initialize)
+            {
+                context.Initialize();
+            }
+
+            return context;
         }
     }
 }

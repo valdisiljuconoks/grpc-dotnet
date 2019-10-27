@@ -22,10 +22,11 @@ using System.Security.Claims;
 using System.Threading.Tasks;
 using FunctionalTestsWebsite.Infrastructure;
 using FunctionalTestsWebsite.Services;
+using Greet;
+using Grpc.AspNetCore.Server.Model;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
-using Microsoft.AspNetCore.Http.Features;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.IdentityModel.Tokens;
@@ -45,20 +46,27 @@ namespace FunctionalTestsWebsite
                 })
                 .AddServiceOptions<GreeterService>(options =>
                 {
-                    options.SendMaxMessageSize = 64 * 1024;
-                    options.ReceiveMaxMessageSize = 64 * 1024;
+                    options.MaxSendMessageSize = 64 * 1024;
+                    options.MaxReceiveMessageSize = 64 * 1024;
+                })
+                .AddServiceOptions<CompressionService>(options =>
+                {
+                    options.ResponseCompressionAlgorithm = "gzip";
                 });
             services.AddHttpContextAccessor();
+
+            services
+                .AddGrpcClient<Greeter.GreeterClient>((s, o) => { o.Address = GetCurrentAddress(s); })
+                .EnableCallContextPropagation();
 
             services.AddAuthorization(options =>
             {
                 options.AddPolicy(JwtBearerDefaults.AuthenticationScheme, policy =>
                 {
                     policy.AddAuthenticationSchemes(JwtBearerDefaults.AuthenticationScheme);
-                    policy.RequireClaim(ClaimTypes.NameIdentifier);
+                    policy.RequireClaim(ClaimTypes.Name);
                 });
             });
-            services.AddAuthorizationPolicyEvaluator();
             services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
                 .AddJwtBearer(options =>
                 {
@@ -79,86 +87,68 @@ namespace FunctionalTestsWebsite
             services.AddTransient<TransientValueProvider>();
             services.AddScoped<ScopedValueProvider>();
 
-            // When the site is run from the test project a signaler will already be registered
-            // This will add a default one if the site is run standalone
-            services.TryAddSingleton<TrailersContainer>();
-
+            // When the site is run from the test project these types will be injected
+            // This will add a default types if the site is run standalone
             services.TryAddSingleton<DynamicEndpointDataSource>();
+            services.TryAddEnumerable(ServiceDescriptor.Singleton<IServiceMethodProvider<DynamicService>, DynamicServiceModelProvider>());
 
             // Add a Singleton service
             services.AddSingleton<SingletonCounterService>();
+
+            static Uri GetCurrentAddress(IServiceProvider serviceProvider)
+            {
+                // Get the address of the current server from the request
+                var context = serviceProvider.GetRequiredService<IHttpContextAccessor>()?.HttpContext;
+                if (context == null)
+                {
+                    throw new InvalidOperationException("Could not get HttpContext.");
+                }
+
+                return new Uri($"{context.Request.Scheme}://{context.Request.Host.Value}");
+            }
         }
 
         // This method gets called by the runtime. Use this method to configure the HTTP request pipeline.
         public void Configure(IApplicationBuilder app)
         {
-            app.Use((context, next) =>
-            {
-                // Workaround for https://github.com/aspnet/AspNetCore/issues/6880
-                if (!context.Response.SupportsTrailers())
-                {
-                    context.Features.Set<IHttpResponseTrailersFeature>(new TestHttpResponseTrailersFeature
-                    {
-                        Trailers = new HeaderDictionary()
-                    });
-                }
+            app.UseRouting();
 
-                // Workaround for https://github.com/aspnet/AspNetCore/issues/7449
-                context.Features.Set<IHttpRequestLifetimeFeature>(new TestHttpRequestLifetimeFeature());
-                // Workaround for https://github.com/aspnet/AspNetCore/issues/7780
-                context.Features.Set<IHttpResponseStartFeature>(new TestHttpResponseStartFeature());
+            app.UseAuthorization();
 
-                return next();
-            });
-
-            app.UseRouting(routes =>
+            app.UseEndpoints(endpoints =>
             {
                 // Bind via reflection
-                routes.MapGrpcService<ChatterService>();
-                routes.MapGrpcService<CounterService>();
-                routes.MapGrpcService<AuthorizedGreeter>();
-                routes.MapGrpcService<SecondGreeterService>();
-                routes.MapGrpcService<LifetimeService>();
-                routes.MapGrpcService<SingletonCounterService>();
+                endpoints.MapGrpcService<ChatterService>();
+                endpoints.MapGrpcService<CounterService>();
+                endpoints.MapGrpcService<AuthorizedGreeter>();
+                endpoints.MapGrpcService<SecondGreeterService>();
+                endpoints.MapGrpcService<LifetimeService>();
+                endpoints.MapGrpcService<SingletonCounterService>();
+                endpoints.MapGrpcService<NestedService>();
+                endpoints.MapGrpcService<CompressionService>();
+                endpoints.MapGrpcService<AnyService>();
+                endpoints.MapGrpcService<GreeterService>();
+                endpoints.MapGrpcService<StreamService>();
+                endpoints.MapGrpcService<RacerService>();
 
-                // Bind via configure method
-                routes.MapGrpcService<GreeterService>(options => options.BindAction = Greet.Greeter.BindService);
+                endpoints.DataSources.Add(endpoints.ServiceProvider.GetRequiredService<DynamicEndpointDataSource>());
 
-                routes.DataSources.Add(routes.ServiceProvider.GetRequiredService<DynamicEndpointDataSource>());
-
-                routes.Map("{FirstSegment}/{SecondSegment}", context =>
+                endpoints.Map("{FirstSegment}/{SecondSegment}", context =>
                 {
                     context.Response.StatusCode = StatusCodes.Status418ImATeapot;
                     return Task.CompletedTask;
                 });
 
-                routes.MapGet("/generateJwtToken", context =>
+                endpoints.MapGet("/generateJwtToken", context =>
                 {
                     return context.Response.WriteAsync(GenerateJwtToken());
                 });
-            });
-
-            app.UseAuthorization();
-
-            app.Use(async (context, next) =>
-            {
-                await next();
-
-                var trailers = context.Features.Get<IHttpResponseTrailersFeature>().Trailers;
-
-                var trailersContainer = context.RequestServices.GetRequiredService<TrailersContainer>();
-
-                trailersContainer.Trailers.Clear();
-                foreach (var trailer in trailers)
-                {
-                    trailersContainer.Trailers[trailer.Key] = trailer.Value;
-                }
             });
         }
 
         private string GenerateJwtToken()
         {
-            var claims = new[] { new Claim(ClaimTypes.NameIdentifier, "testuser") };
+            var claims = new[] { new Claim(ClaimTypes.Name, "testuser") };
             var credentials = new SigningCredentials(SecurityKey, SecurityAlgorithms.HmacSha256);
             var token = new JwtSecurityToken("FunctionalTestServer", "FunctionalTests", claims, expires: DateTime.Now.AddSeconds(5), signingCredentials: credentials);
             return JwtTokenHandler.WriteToken(token);

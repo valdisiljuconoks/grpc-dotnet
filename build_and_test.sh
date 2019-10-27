@@ -15,9 +15,39 @@
 
 set -ex
 
-# Required when using nightly builds of gRPC packages
-# ./build/get-grpc.sh
+source activate.sh
 
-dotnet build
+echo "Building solution"
 
-dotnet test
+dotnet build -c Release
+
+echo "Building examples"
+
+example_solutions=( $( ls examples/**/*.sln ) )
+
+for example_solution in "${example_solutions[@]}"
+do
+    dotnet build $example_solution -c Release
+done
+
+echo "Testing solution"
+
+test_projects=( $( ls test/**/*Tests.csproj ) )
+
+for test_project in "${test_projects[@]}"
+do
+    # "dotnet test" is hanging when it writes to console for an unknown reason
+    # Tracking issue at https://github.com/microsoft/vstest/issues/2080
+    # Write test output to a text file and then write the text file to console as a workaround
+    {
+        dotnet test $test_project -c Release -v n --no-build &> ${test_project##*/}.log.txt &&
+        echo "Success" &&
+        cat ${test_project##*/}.log.txt
+    } || {
+        echo "Failure" &&
+        cat ${test_project##*/}.log.txt &&
+        exit 1
+    }
+done
+
+echo "Finished"

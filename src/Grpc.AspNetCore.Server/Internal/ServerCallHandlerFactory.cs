@@ -17,10 +17,14 @@
 #endregion
 
 using System;
+using System.Collections;
 using System.Collections.Generic;
+using System.Linq;
 using System.Threading.Tasks;
 using Grpc.AspNetCore.Server.Internal.CallHandlers;
+using Grpc.AspNetCore.Server.Model;
 using Grpc.Core;
+using Grpc.Net.Compression;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -33,11 +37,20 @@ namespace Grpc.AspNetCore.Server.Internal
     internal partial class ServerCallHandlerFactory<TService> where TService : class
     {
         private readonly ILoggerFactory _loggerFactory;
+        private readonly IGrpcServiceActivator<TService> _serviceActivator;
+        private readonly IServiceProvider _serviceProvider;
         private readonly GrpcServiceOptions _resolvedOptions;
 
-        public ServerCallHandlerFactory(ILoggerFactory loggerFactory, IOptions<GrpcServiceOptions> globalOptions, IOptions<GrpcServiceOptions<TService>> serviceOptions)
+        public ServerCallHandlerFactory(
+            ILoggerFactory loggerFactory,
+            IOptions<GrpcServiceOptions> globalOptions,
+            IOptions<GrpcServiceOptions<TService>> serviceOptions,
+            IGrpcServiceActivator<TService> serviceActivator,
+            IServiceProvider serviceProvider)
         {
             _loggerFactory = loggerFactory;
+            _serviceActivator = serviceActivator;
+            _serviceProvider = serviceProvider;
 
             var so = serviceOptions.Value;
             var go = globalOptions.Value;
@@ -47,37 +60,70 @@ namespace Grpc.AspNetCore.Server.Internal
             _resolvedOptions = new GrpcServiceOptions
             {
                 EnableDetailedErrors = so.EnableDetailedErrors ?? go.EnableDetailedErrors,
-                ReceiveMaxMessageSize = so.ReceiveMaxMessageSize ?? go.ReceiveMaxMessageSize,
-                SendMaxMessageSize = so.SendMaxMessageSize ?? go.SendMaxMessageSize
+                MaxReceiveMessageSize = so.MaxReceiveMessageSize ?? go.MaxReceiveMessageSize,
+                MaxSendMessageSize = so.MaxSendMessageSize ?? go.MaxSendMessageSize,
+                ResponseCompressionAlgorithm = so.ResponseCompressionAlgorithm ?? go.ResponseCompressionAlgorithm,
+                ResponseCompressionLevel = so.ResponseCompressionLevel ?? go.ResponseCompressionLevel
             };
+
+            var resolvedCompressionProviders = new Dictionary<string, ICompressionProvider>(StringComparer.Ordinal);
+            AddCompressionProviders(resolvedCompressionProviders, so._compressionProviders);
+            AddCompressionProviders(resolvedCompressionProviders, go._compressionProviders);
+            _resolvedOptions.ResolvedCompressionProviders = resolvedCompressionProviders;
+
+            _resolvedOptions.Interceptors.AddRange(go.Interceptors);
+            _resolvedOptions.Interceptors.AddRange(so.Interceptors);
+            _resolvedOptions.HasInterceptors = _resolvedOptions.Interceptors.Count > 0;
+
+            if (_resolvedOptions.ResponseCompressionAlgorithm != null)
+            {
+                if (!_resolvedOptions.ResolvedCompressionProviders.TryGetValue(_resolvedOptions.ResponseCompressionAlgorithm, out var _))
+                {
+                    throw new InvalidOperationException($"The configured response compression algorithm '{_resolvedOptions.ResponseCompressionAlgorithm}' does not have a matching compression provider.");
+                }
+            }
+        }
+
+        private static void AddCompressionProviders(Dictionary<string, ICompressionProvider> resolvedProviders, IList<ICompressionProvider>? compressionProviders)
+        {
+            if (compressionProviders != null)
+            {
+                foreach (var compressionProvider in compressionProviders)
+                {
+                    if (!resolvedProviders.ContainsKey(compressionProvider.EncodingName))
+                    {
+                        resolvedProviders.Add(compressionProvider.EncodingName, compressionProvider);
+                    }
+                }
+            }
         }
 
         public UnaryServerCallHandler<TService, TRequest, TResponse> CreateUnary<TRequest, TResponse>(Method<TRequest, TResponse> method, UnaryServerMethod<TService, TRequest, TResponse> invoker)
             where TRequest : class
             where TResponse : class
         {
-            return new UnaryServerCallHandler<TService, TRequest, TResponse>(method, invoker, _resolvedOptions, _loggerFactory);
+            return new UnaryServerCallHandler<TService, TRequest, TResponse>(method, invoker, _resolvedOptions, _loggerFactory, _serviceActivator, _serviceProvider);
         }
 
         public ClientStreamingServerCallHandler<TService, TRequest, TResponse> CreateClientStreaming<TRequest, TResponse>(Method<TRequest, TResponse> method, ClientStreamingServerMethod<TService, TRequest, TResponse> invoker)
             where TRequest : class
             where TResponse : class
         {
-            return new ClientStreamingServerCallHandler<TService, TRequest, TResponse>(method, invoker, _resolvedOptions, _loggerFactory);
+            return new ClientStreamingServerCallHandler<TService, TRequest, TResponse>(method, invoker, _resolvedOptions, _loggerFactory, _serviceActivator, _serviceProvider);
         }
 
         public DuplexStreamingServerCallHandler<TService, TRequest, TResponse> CreateDuplexStreaming<TRequest, TResponse>(Method<TRequest, TResponse> method, DuplexStreamingServerMethod<TService, TRequest, TResponse> invoker)
             where TRequest : class
             where TResponse : class
         {
-            return new DuplexStreamingServerCallHandler<TService, TRequest, TResponse>(method, invoker, _resolvedOptions, _loggerFactory);
+            return new DuplexStreamingServerCallHandler<TService, TRequest, TResponse>(method, invoker, _resolvedOptions, _loggerFactory, _serviceActivator, _serviceProvider);
         }
 
         public ServerStreamingServerCallHandler<TService, TRequest, TResponse> CreateServerStreaming<TRequest, TResponse>(Method<TRequest, TResponse> method, ServerStreamingServerMethod<TService, TRequest, TResponse> invoker)
             where TRequest : class
             where TResponse : class
         {
-            return new ServerStreamingServerCallHandler<TService, TRequest, TResponse>(method, invoker, _resolvedOptions, _loggerFactory);
+            return new ServerStreamingServerCallHandler<TService, TRequest, TResponse>(method, invoker, _resolvedOptions, _loggerFactory, _serviceActivator, _serviceProvider);
         }
 
         public RequestDelegate CreateUnimplementedMethod()
@@ -88,10 +134,11 @@ namespace Grpc.AspNetCore.Server.Internal
             {
                 GrpcProtocolHelpers.AddProtocolHeaders(httpContext.Response);
 
-                var unimplementedMethod = httpContext.Request.RouteValues["unimplementedMethod"]?.ToString();
+                var unimplementedMethod = httpContext.Request.RouteValues["unimplementedMethod"]?.ToString() ?? "<unknown>";
                 Log.MethodUnimplemented(logger, unimplementedMethod);
+                GrpcEventSource.Log.CallUnimplemented(httpContext.Request.Path.Value);
 
-                GrpcProtocolHelpers.AppendStatusTrailers(httpContext.Response, new Status(StatusCode.Unimplemented, "Method is unimplemented."));
+                GrpcProtocolHelpers.SetStatus(GrpcProtocolHelpers.GetTrailersDestination(httpContext.Response), new Status(StatusCode.Unimplemented, "Method is unimplemented."));
                 return Task.CompletedTask;
             };
         }
@@ -104,20 +151,21 @@ namespace Grpc.AspNetCore.Server.Internal
             {
                 GrpcProtocolHelpers.AddProtocolHeaders(httpContext.Response);
 
-                var unimplementedService = httpContext.Request.RouteValues["unimplementedService"]?.ToString();
+                var unimplementedService = httpContext.Request.RouteValues["unimplementedService"]?.ToString() ?? "<unknown>";
                 Log.ServiceUnimplemented(logger, unimplementedService);
+                GrpcEventSource.Log.CallUnimplemented(httpContext.Request.Path.Value);
 
-                GrpcProtocolHelpers.AppendStatusTrailers(httpContext.Response, new Status(StatusCode.Unimplemented, "Service is unimplemented."));
+                GrpcProtocolHelpers.SetStatus(GrpcProtocolHelpers.GetTrailersDestination(httpContext.Response), new Status(StatusCode.Unimplemented, "Service is unimplemented."));
                 return Task.CompletedTask;
             };
         }
 
         private static class Log
         {
-            private static readonly Action<ILogger, string, Exception> _serviceUnimplemented =
+            private static readonly Action<ILogger, string, Exception?> _serviceUnimplemented =
                 LoggerMessage.Define<string>(LogLevel.Information, new EventId(1, "ServiceUnimplemented"), "Service '{ServiceName}' is unimplemented.");
 
-            private static readonly Action<ILogger, string, Exception> _methodUnimplemented =
+            private static readonly Action<ILogger, string, Exception?> _methodUnimplemented =
                 LoggerMessage.Define<string>(LogLevel.Information, new EventId(2, "MethodUnimplemented"), "Method '{MethodName}' is unimplemented.");
 
             public static void ServiceUnimplemented(ILogger logger, string serviceName)

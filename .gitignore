@@ -38,3 +38,5 @@ global.json
 .vscode/
 *.binlog
 build/feed
+.dotnet/
+*.log.txt

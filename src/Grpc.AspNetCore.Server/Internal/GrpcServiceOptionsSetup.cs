@@ -16,6 +16,8 @@
 
 #endregion
 
+using System.IO.Compression;
+using Grpc.Net.Compression;
 using Microsoft.Extensions.Options;
 
 namespace Grpc.AspNetCore.Server.Internal
@@ -29,9 +31,14 @@ namespace Grpc.AspNetCore.Server.Internal
 
         public void Configure(GrpcServiceOptions options)
         {
-            if (options.ReceiveMaxMessageSize == null)
+            if (options.MaxReceiveMessageSize == null)
             {
-                options.ReceiveMaxMessageSize = DefaultReceiveMaxMessageSize;
+                options.MaxReceiveMessageSize = DefaultReceiveMaxMessageSize;
+            }
+            if (options._compressionProviders == null || options._compressionProviders.Count == 0)
+            {
+                options.CompressionProviders.Add(new GzipCompressionProvider(CompressionLevel.Fastest));
+                // deflate is not supported. .NET's DeflateStream does not support RFC1950 - https://github.com/dotnet/corefx/issues/7570
             }
         }
     }
@@ -47,9 +54,12 @@ namespace Grpc.AspNetCore.Server.Internal
 
         public void Configure(GrpcServiceOptions<TService> options)
         {
-            options.ReceiveMaxMessageSize = _options.ReceiveMaxMessageSize;
-            options.SendMaxMessageSize = _options.SendMaxMessageSize;
+            options.MaxReceiveMessageSize = _options.MaxReceiveMessageSize;
+            options.MaxSendMessageSize = _options.MaxSendMessageSize;
             options.EnableDetailedErrors = _options.EnableDetailedErrors;
+            options.ResponseCompressionAlgorithm = _options.ResponseCompressionAlgorithm;
+            options.ResponseCompressionLevel = _options.ResponseCompressionLevel;
+            options.CompressionProviders = _options.CompressionProviders;
         }
     }
 }

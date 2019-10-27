@@ -16,6 +16,10 @@
 
 #endregion
 
+using System.Collections.Generic;
+using System.IO.Compression;
+using Grpc.Net.Compression;
+
 namespace Grpc.AspNetCore.Server
 {
     /// <summary>
@@ -23,21 +27,62 @@ namespace Grpc.AspNetCore.Server
     /// </summary>
     public class GrpcServiceOptions
     {
+        internal IList<ICompressionProvider>? _compressionProviders;
+
+        // Fast check for interceptors is used per-request
+        internal bool HasInterceptors { get; set; }
+        // Compression providers by encoding name
+        internal Dictionary<string, ICompressionProvider>? ResolvedCompressionProviders;
+
         /// <summary>
         /// Gets or sets the maximum message size in bytes that can be sent from the server.
         /// </summary>
-        public int? SendMaxMessageSize { get; set; }
+        public int? MaxSendMessageSize { get; set; }
 
         /// <summary>
         /// Gets or sets the maximum message size in bytes that can be received by the server.
         /// </summary>
-        public int? ReceiveMaxMessageSize { get; set; }
+        public int? MaxReceiveMessageSize { get; set; }
 
         /// <summary>
         /// Gets or sets a value indicating whether detailed error messages are sent to the peer.
         /// Detailed error messages include details from exceptions thrown on the server.
         /// </summary>
         public bool? EnableDetailedErrors { get; set; } = null;
+
+        /// <summary>
+        /// Gets or sets the compression algorithm used to compress messages sent from the server.
+        /// The request grpc-accept-encoding header value must contain this algorithm for it to
+        /// be used.
+        /// </summary>
+        public string? ResponseCompressionAlgorithm { get; set; }
+
+        /// <summary>
+        /// Gets or sets the compression level used to compress messages sent from the server.
+        /// The compression level will be passed to the compression provider.
+        /// </summary>
+        public CompressionLevel? ResponseCompressionLevel { get; set; }
+
+        /// <summary>
+        /// Gets or sets the list of compression providers used to compress and decompress gRPC messages.
+        /// </summary>
+        public IList<ICompressionProvider> CompressionProviders
+        {
+            get
+            {
+                if (_compressionProviders == null)
+                {
+                    _compressionProviders = new List<ICompressionProvider>();
+                }
+                return _compressionProviders;
+            }
+            set => _compressionProviders = value;
+        }
+
+        /// <summary>
+        /// Get a collection of interceptors to be executed with every call. Interceptors are executed in order.
+        /// </summary>
+        public InterceptorCollection Interceptors { get; } = new InterceptorCollection();
     }
 
     /// <summary>

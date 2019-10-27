@@ -17,10 +17,14 @@
 #endregion
 
 using System;
+using System.Collections.Generic;
+using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
-using System.Threading.Tasks;
+using System.Security.Cryptography.X509Certificates;
+using System.Text;
 using Grpc.Core;
 using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Http.Features;
 using Microsoft.Extensions.Primitives;
 
 namespace Grpc.AspNetCore.Server.Internal
@@ -102,29 +106,27 @@ namespace Grpc.AspNetCore.Server.Internal
             return false;
         }
 
-        public static bool IsValidContentType(HttpContext httpContext, out string error)
+        public static bool IsInvalidContentType(HttpContext httpContext, [NotNullWhen(true)]out string? error)
         {
             if (httpContext.Request.ContentType == null)
             {
                 error = "Content-Type is missing from the request.";
-                return false;
+                return true;
             }
             else if (!IsGrpcContentType(httpContext.Request.ContentType))
             {
                 error = $"Content-Type '{httpContext.Request.ContentType}' is not supported.";
-                return false;
+                return true;
             }
 
             error = null;
-            return true;
+            return false;
         }
 
-        public static Task SendHttpError(HttpResponse response, StatusCode statusCode, string message)
+        public static void BuildHttpErrorResponse(HttpResponse response, int httpStatusCode, StatusCode grpcStatusCode, string message)
         {
-            response.StatusCode = StatusCodes.Status415UnsupportedMediaType;
-            response.AppendTrailer(GrpcProtocolConstants.StatusTrailer, statusCode.ToTrailerString());
-            response.AppendTrailer(GrpcProtocolConstants.MessageTrailer, message);
-            return response.WriteAsync(message);
+            response.StatusCode = httpStatusCode;
+            SetStatus(GetTrailersDestination(response), new Status(grpcStatusCode, message));
         }
 
         public static byte[] ParseBinaryHeader(string base64)
@@ -154,14 +156,105 @@ namespace Grpc.AspNetCore.Server.Internal
 
         public static void AddProtocolHeaders(HttpResponse response)
         {
-            response.ContentType = "application/grpc";
-            response.Headers.Append("grpc-encoding", "identity");
+            response.ContentType = GrpcProtocolConstants.GrpcContentType;
         }
 
-        public static void AppendStatusTrailers(HttpResponse response, Status status)
+        public static void SetStatus(IHeaderDictionary destination, Status status)
         {
-            response.AppendTrailer(GrpcProtocolConstants.StatusTrailer, status.StatusCode.ToTrailerString());
-            response.AppendTrailer(GrpcProtocolConstants.MessageTrailer, status.Detail);
+            // Overwrite any previously set status
+            destination[GrpcProtocolConstants.StatusTrailer] = status.StatusCode.ToTrailerString();
+
+            string? escapedDetail;
+            if (!string.IsNullOrEmpty(status.Detail))
+            {
+                // https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-HTTP2.md#responses
+                // The value portion of Status-Message is conceptually a Unicode string description of the error,
+                // physically encoded as UTF-8 followed by percent-encoding.
+                escapedDetail = PercentEncodingHelpers.PercentEncode(status.Detail);
+            }
+            else
+            {
+                escapedDetail = null;
+            }
+
+            destination[GrpcProtocolConstants.MessageTrailer] = escapedDetail;
+        }
+
+        public static IHeaderDictionary GetTrailersDestination(HttpResponse response)
+        {
+            if (response.HasStarted)
+            {
+                // The response has content so write trailers to a trailing HEADERS frame
+                var feature = response.HttpContext.Features.Get<IHttpResponseTrailersFeature>();
+                if (feature?.Trailers == null || feature.Trailers.IsReadOnly)
+                {
+                    throw new InvalidOperationException("Trailers are not supported for this response. The server may not support gRPC.");
+                }
+
+                return feature.Trailers;
+            }
+            else
+            {
+                // The response is "Trailers-Only". There are no gRPC messages in the response so the status
+                // and other trailers can be placed in the header HEADERS frame
+                return response.Headers;
+            }
+        }
+
+        public static AuthContext CreateAuthContext(X509Certificate2 clientCertificate)
+        {
+            // Map X509Certificate2 values to AuthContext. The name/values come BoringSSL via C Core
+            // https://github.com/grpc/grpc/blob/a3cc5361e6f6eb679ccf5c36ecc6d0ca41b64f4f/src/core/lib/security/security_connector/ssl_utils.cc#L206-L248
+
+            var properties = new Dictionary<string, List<AuthProperty>>(StringComparer.Ordinal);
+
+            string? peerIdentityPropertyName = null;
+
+            var dnsNames = X509CertificateHelpers.GetDnsFromExtensions(clientCertificate);
+            foreach (var dnsName in dnsNames)
+            {
+                AddProperty(properties, GrpcProtocolConstants.X509SubjectAlternativeNameKey, dnsName);
+
+                if (peerIdentityPropertyName == null)
+                {
+                    peerIdentityPropertyName = GrpcProtocolConstants.X509SubjectAlternativeNameKey;
+                }
+            }
+
+            var commonName = clientCertificate.GetNameInfo(X509NameType.SimpleName, false);
+            if (commonName != null)
+            {
+                AddProperty(properties, GrpcProtocolConstants.X509CommonNameKey, commonName);
+                if (peerIdentityPropertyName == null)
+                {
+                    peerIdentityPropertyName = GrpcProtocolConstants.X509CommonNameKey;
+                }
+            }
+
+            return new AuthContext(peerIdentityPropertyName, properties);
+
+            static void AddProperty(Dictionary<string, List<AuthProperty>> properties, string name, string value)
+            {
+                if (!properties.TryGetValue(name, out var values))
+                {
+                    values = new List<AuthProperty>();
+                    properties[name] = values;
+                }
+
+                values.Add(AuthProperty.Create(name, Encoding.UTF8.GetBytes(value)));
+            }
+        }
+
+        internal static bool CanWriteCompressed(WriteOptions? writeOptions)
+        {
+            if (writeOptions == null)
+            {
+                return true;
+            }
+
+            var canCompress = (writeOptions.Flags & WriteFlags.NoCompress) != WriteFlags.NoCompress;
+
+            return canCompress;
         }
     }
 }

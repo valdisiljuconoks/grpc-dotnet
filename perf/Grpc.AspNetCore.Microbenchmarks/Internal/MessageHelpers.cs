@@ -28,15 +28,22 @@ namespace Grpc.AspNetCore.Microbenchmarks.Internal
 {
     internal static class MessageHelpers
     {
-        private static readonly HttpContextServerCallContext TestServerCallContext = new HttpContextServerCallContext(new DefaultHttpContext(), new GrpcServiceOptions(), NullLogger.Instance);
+        private static readonly HttpContextServerCallContext TestServerCallContext = new HttpContextServerCallContext(
+            new DefaultHttpContext(),
+            new GrpcServiceOptions(),
+            NullLogger.Instance);
 
-        public static void WriteMessage<T>(Stream stream, T message) where T : IMessage
+        static MessageHelpers()
         {
-            var messageData = message.ToByteArray();
+            TestServerCallContext.Initialize();
+        }
 
-            var pipeWriter = new StreamPipeWriter(stream);
+        public static void WriteMessage<T>(Stream stream, T message, HttpContextServerCallContext? callContext = null)
+            where T : class, IMessage
+        {
+            var pipeWriter = PipeWriter.Create(stream);
 
-            PipeExtensions.WriteMessageAsync(pipeWriter, messageData, TestServerCallContext, flush: true).GetAwaiter().GetResult();
+            PipeExtensions.WriteMessageAsync(pipeWriter, message, callContext ?? TestServerCallContext, (r, c) => c.Complete(r.ToByteArray()), canFlush: true).GetAwaiter().GetResult();
         }
     }
 }
